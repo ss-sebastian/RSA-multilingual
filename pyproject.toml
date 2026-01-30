@@ -9,7 +9,7 @@ description = "Multilingual RSA pipeline (extract -> rsa -> viz) for LLM embeddi
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name="Sebastian"}]
+authors = [{name="Sebastian Chuqiao Song", email=songchuqiao23@gmail.com"}]
 
 dependencies = [
   "numpy>=1.23",
