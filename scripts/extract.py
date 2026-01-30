@@ -1,515 +1,474 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+rsa.py
+
+Compute RSA (Representational Similarity Analysis) artifacts per Transformer layer.
+
+Assumptions:
+- rsa.py and extract.py are in the same directory (e.g., /script).
+- extract.py provides: extract_transformer_hidden_states (wrapper/constructor)
+- extractor instance provides: get_concept_vectors(...) (recommended)
+- extractor instance optionally provides: get_config_page() (nice-to-have)
+
+Outputs:
+- rdm_layer{L}.npy        (square RDM)
+- rdm_layer{L}.csv        (square RDM with labels)
+- rsa_long.csv            (upper triangle long-form table: layer, item_i, item_j, dissimilarity)
+- layerwise_rdm_similarity.csv (optional: Spearman between layer RDMs)
+- target_rdm.csv/.npy + layer_vs_target_rsa.csv (optional if you provide --target_groups)
+
+Distance metrics:
+- correlation (default): 1 - PearsonCorr(vec_i, vec_j)
+- cosine: 1 - cosine similarity
+- euclidean: L2 distance
+"""
+
 from __future__ import annotations
 
+import argparse
+import inspect
 import json
-from dataclasses import dataclass
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 import torch
-from transformers import AutoModel, AutoTokenizer
-
-Tensor = torch.Tensor
 
 
-@dataclass
-class ExtractionConfig:
-    model_name: str
-    device: str = "cpu"
-    max_length: int = 32
-    default_pooling: str = "mean"  # "mean" | "cls" | "last"
-    batch_size: int = 32
-    torch_dtype: Optional[str] = None  # e.g. "float16" if on GPU
-    trust_remote_code: bool = False
+# -----------------------------
+# Import extract.py robustly
+# -----------------------------
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+try:
+    from extract import extract_transformer_hidden_states  # must exist in extract.py
+except Exception as e:
+    raise ImportError(
+        "Cannot import extract_transformer_hidden_states from extract.py. "
+        "Make sure rsa.py and extract.py are in the same folder and extract.py defines it."
+    ) from e
 
 
-class HiddenStateExtractor:
+# -----------------------------
+# Utilities: signature-safe calls
+# -----------------------------
+def _filter_kwargs(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only kwargs that appear in fn signature."""
+    sig = inspect.signature(fn)
+    allowed = set(sig.parameters.keys())
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def _safe_construct_extractor(**kwargs):
+    """Construct extractor using only supported kwargs."""
+    ctor = extract_transformer_hidden_states
+    use = _filter_kwargs(ctor, kwargs)
+    return ctor(**use)
+
+
+def _safe_call(obj, method_name: str, **kwargs):
+    """Call obj.method_name using only supported kwargs."""
+    if not hasattr(obj, method_name):
+        raise AttributeError(f"Extractor has no method '{method_name}'")
+    fn = getattr(obj, method_name)
+    use = _filter_kwargs(fn, kwargs)
+    return fn(**use)
+
+
+# -----------------------------
+# Input loaders
+# -----------------------------
+def _read_table(path: Path) -> pd.DataFrame:
+    sep = "\t" if path.suffix.lower() == ".tsv" else ","
+    return pd.read_csv(path, sep=sep)
+
+
+def load_concept_map(path: str) -> Dict[str, List[str]]:
     """
-    Unified hidden-state extractor for HuggingFace Transformers.
+    JSON:
+      { "HOUSE": ["house","casa"], "DOG": ["dog","perro"] }
 
-    Designed for your setting:
-      - single-word (or single surface form) inputs
-      - word-level pooling excluding special/pad tokens
-      - concept pooling across multiple surface forms (e.g., cross-lingual synonyms)
+    CSV/TSV:
+      concept,form
+      HOUSE,house
+      HOUSE,casa
+      DOG,dog
 
-    HF hidden_states indexing:
-      hidden_states[0] = embeddings
-      hidden_states[1..N] = transformer blocks
-      hidden_states[-1] = last block
+    NOTE: preserves concept order by first appearance in file.
     """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"inputs not found: {p}")
 
-    def __init__(self, cfg: ExtractionConfig):
-        self.cfg = cfg
+    suf = p.suffix.lower()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model_name, use_fast=True, trust_remote_code=cfg.trust_remote_code
-        )
-
-        # Ensure pad_token exists for batching/padding
-        if self.tokenizer.pad_token is None:
-            if getattr(self.tokenizer, "eos_token", None) is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+    if suf == ".json":
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError("JSON inputs must be a dict: concept -> list[str]")
+        out: Dict[str, List[str]] = {}
+        for k, v in obj.items():
+            if isinstance(v, str):
+                out[str(k)] = [v]
+            elif isinstance(v, list):
+                out[str(k)] = [str(x) for x in v if x is not None]
             else:
-                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                raise ValueError(f"Bad value type for concept {k}: {type(v)}")
+        return out
 
-        # dtype handling
-        torch_dtype = None
-        if cfg.torch_dtype is not None:
-            torch_dtype = getattr(torch, cfg.torch_dtype)
+    if suf in {".csv", ".tsv"}:
+        df = _read_table(p)
+        cols = {c.lower(): c for c in df.columns}
+        if "concept" not in cols or "form" not in cols:
+            raise ValueError("CSV/TSV inputs must have columns: concept, form")
+        c_col, f_col = cols["concept"], cols["form"]
 
-        self.model = AutoModel.from_pretrained(
-            cfg.model_name,
-            output_hidden_states=True,
-            torch_dtype=torch_dtype,
-            trust_remote_code=cfg.trust_remote_code,
-        )
-        self.model.to(cfg.device)
-        self.model.eval()
+        concept_to_forms: Dict[str, List[str]] = {}
+        for _, row in df.iterrows():
+            concept = str(row[c_col])
+            form = row[f_col]
+            if pd.isna(form):
+                continue
+            form = str(form)
+            if concept not in concept_to_forms:
+                concept_to_forms[concept] = []
+            concept_to_forms[concept].append(form)
 
-        # If we added a special token, tokenizer size may exceed embedding size
-        if len(self.tokenizer) > self.model.get_input_embeddings().num_embeddings:
-            self.model.resize_token_embeddings(len(self.tokenizer))
+        if not concept_to_forms:
+            raise ValueError("No valid rows in inputs.")
+        return concept_to_forms
 
-        # Robust decoder-only detection
-        mcfg = getattr(self.model, "config", None)
-        is_encoder_decoder = bool(getattr(mcfg, "is_encoder_decoder", False))
-        is_decoder_flag = bool(getattr(mcfg, "is_decoder", False))
-        # For decoder-only LMs, is_decoder True and is_encoder_decoder False
-        self.is_decoder_only = (is_decoder_flag and not is_encoder_decoder)
+    raise ValueError("Unsupported inputs format. Use .json, .csv, or .tsv.")
 
-        # cached config
-        self.model_config_dict = self.model.config.to_dict() if hasattr(self.model, "config") else {}
-        self.tokenizer_config_dict = {
-            "tokenizer_class": self.tokenizer.__class__.__name__,
-            "is_fast": getattr(self.tokenizer, "is_fast", None),
-            "vocab_size": getattr(self.tokenizer, "vocab_size", None),
-            "model_max_length": getattr(self.tokenizer, "model_max_length", None),
-            "pad_token": self.tokenizer.pad_token,
-            "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
-            "eos_token": getattr(self.tokenizer, "eos_token", None),
-            "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
-            "bos_token": getattr(self.tokenizer, "bos_token", None),
-            "bos_token_id": getattr(self.tokenizer, "bos_token_id", None),
-            "unk_token": getattr(self.tokenizer, "unk_token", None),
-            "unk_token_id": getattr(self.tokenizer, "unk_token_id", None),
-            "cls_token": getattr(self.tokenizer, "cls_token", None),
-            "cls_token_id": getattr(self.tokenizer, "cls_token_id", None),
-            "sep_token": getattr(self.tokenizer, "sep_token", None),
-            "sep_token_id": getattr(self.tokenizer, "sep_token_id", None),
-            "special_tokens_map": getattr(self.tokenizer, "special_tokens_map", None),
-        }
 
-    # -------------------------
-    # Core: token->pooled vector
-    # -------------------------
+def load_target_groups(path: Optional[str]) -> Optional[Dict[str, str]]:
+    """
+    Optional CSV/TSV:
+      concept,group
+      HOUSE,semantic_A
+      DOG,semantic_B
+    """
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"target_groups not found: {p}")
+    if p.suffix.lower() not in {".csv", ".tsv"}:
+        raise ValueError("target_groups must be .csv or .tsv")
+    df = _read_table(p)
+    cols = {c.lower(): c for c in df.columns}
+    if "concept" not in cols or "group" not in cols:
+        raise ValueError("target_groups file must have columns: concept, group")
+    c_col, g_col = cols["concept"], cols["group"]
+    return dict(zip(df[c_col].astype(str), df[g_col].astype(str)))
 
-    @torch.no_grad()
-    def get_hidden_states(
-        self,
-        text: Union[str, List[str]],
-        layers: Optional[List[int]] = None,
-        pooling: Optional[str] = None,
-        return_token_level: bool = False,
-        return_tokenization_meta: bool = False,
-    ) -> Union[
-        Dict[int, Tensor],
-        Tuple[Dict[int, Tensor], Tuple[Tensor, ...], Dict[str, Tensor]],
-        Tuple[Dict[int, Tensor], Dict[str, Any]],
-        Tuple[Dict[int, Tensor], Tuple[Tensor, ...], Dict[str, Tensor], Dict[str, Any]],
-    ]:
-        """
-        Extract pooled representations for selected layers.
 
-        Pooling here is word-level pooling for single-form inputs:
-        we exclude special tokens and padding.
+def ensure_out_dir(out_dir: str) -> Path:
+    p = Path(out_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-        Args:
-            text: string or list of strings
-            layers: layer indices (default [-1])
-            pooling: "mean" | "cls" | "last"
-                - mean: mean over valid content tokens (non-pad & non-special)
-                - cls: first token vector (for BERT-like; usually NOT "word vector")
-                - last: last valid content token (non-pad & non-special), safer for decoder-only
-            return_token_level: also return hidden_states tuple and inputs dict
-            return_tokenization_meta: return a dict with tokens, token_ids, masks, token counts
 
-        Returns:
-            pooled_by_layer: dict layer_idx -> [B, H]
-            optionally also token-level data and/or tokenization meta
-        """
-        texts = [text] if isinstance(text, str) else text
-        if layers is None:
-            layers = [-1]
+# -----------------------------
+# RDM / Distance
+# -----------------------------
+def compute_rdm(X: np.ndarray, metric: str = "correlation", eps: float = 1e-12) -> np.ndarray:
+    """
+    X: [N, H] concept vectors
+    Returns: [N, N] dissimilarity matrix
+    """
+    metric = metric.lower()
+    if X.ndim != 2:
+        raise ValueError(f"X must be [N,H], got {X.shape}")
 
-        pooling = pooling or (("last" if self.is_decoder_only else self.cfg.default_pooling))
-        pooling = pooling.lower()
+    if metric == "correlation":
+        Xc = X - X.mean(axis=1, keepdims=True)
+        denom = np.linalg.norm(Xc, axis=1, keepdims=True)
+        denom = np.maximum(denom, eps)
+        Xn = Xc / denom
+        corr = Xn @ Xn.T
+        D = 1.0 - corr
 
-        inputs = self.tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.cfg.max_length,
-            return_special_tokens_mask=True,
-            return_attention_mask=True,
-        )
-        inputs = {k: v.to(self.cfg.device) for k, v in inputs.items()}
+    elif metric == "cosine":
+        denom = np.linalg.norm(X, axis=1, keepdims=True)
+        denom = np.maximum(denom, eps)
+        Xn = X / denom
+        sim = Xn @ Xn.T
+        D = 1.0 - sim
 
-        outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-        hidden_states = outputs.hidden_states  # tuple of [B, T, H]
+    elif metric == "euclidean":
+        sq = np.sum(X * X, axis=1, keepdims=True)
+        D2 = sq + sq.T - 2.0 * (X @ X.T)
+        D2 = np.maximum(D2, 0.0)
+        D = np.sqrt(D2)
 
-        attn_mask = inputs.get("attention_mask", None)
-        special_mask = inputs.get("special_tokens_mask", None)
+    else:
+        raise ValueError("metric must be: correlation | cosine | euclidean")
 
-        pooled_by_layer: Dict[int, Tensor] = {}
-        for li in layers:
-            x = hidden_states[li]  # [B, T, H]
-            pooled_by_layer[li] = self._pool(
-                x=x,
-                attention_mask=attn_mask,
-                special_tokens_mask=special_mask,
-                pooling=pooling,
-            )
+    # enforce symmetry + zero diagonal
+    D = (D + D.T) / 2.0
+    np.fill_diagonal(D, 0.0)
+    return D
 
-        meta: Optional[Dict[str, Any]] = None
-        if return_tokenization_meta:
-            meta = self._build_tokenization_meta(inputs)
 
-        if return_token_level and return_tokenization_meta:
-            return pooled_by_layer, hidden_states, inputs, meta
-        if return_token_level:
-            return pooled_by_layer, hidden_states, inputs
-        if return_tokenization_meta:
-            return pooled_by_layer, meta  # type: ignore
-        return pooled_by_layer
+def rdm_upper_triangle(D: np.ndarray) -> np.ndarray:
+    if D.ndim != 2 or D.shape[0] != D.shape[1]:
+        raise ValueError("RDM must be square")
+    iu = np.triu_indices(D.shape[0], k=1)
+    return D[iu]
 
-    def _pool(
-        self,
-        x: Tensor,
-        attention_mask: Optional[Tensor],
-        special_tokens_mask: Optional[Tensor],
-        pooling: str,
-    ) -> Tensor:
-        """
-        Pool token-level hidden states into a single vector per sequence.
 
-        x: [B, T, H]
-        attention_mask: [B, T] (1 real, 0 pad)
-        special_tokens_mask: [B, T] (1 special, 0 normal)
-        returns: [B, H]
-        """
-        B, T, H = x.shape
+def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        raise ValueError("Spearman inputs must have same shape")
+    ra = pd.Series(a).rank(method="average").to_numpy()
+    rb = pd.Series(b).rank(method="average").to_numpy()
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    denom = np.linalg.norm(ra) * np.linalg.norm(rb)
+    if denom == 0:
+        return float("nan")
+    return float(np.dot(ra, rb) / denom)
 
-        # valid = non-pad & non-special
-        if attention_mask is None:
-            valid = torch.ones((B, T), dtype=torch.bool, device=x.device)
-        else:
-            valid = attention_mask.bool()
 
-        if special_tokens_mask is not None:
-            valid = valid & (~special_tokens_mask.bool())
+def categorical_target_rdm(concept_ids: List[str], concept_to_group: Dict[str, str]) -> np.ndarray:
+    """
+    Simple target RDM: 0 if same group else 1.
+    Missing concept -> its own unique group.
+    """
+    groups = [concept_to_group.get(cid, f"__MISSING__:{cid}") for cid in concept_ids]
+    N = len(concept_ids)
+    D = np.zeros((N, N), dtype=float)
+    for i in range(N):
+        for j in range(i + 1, N):
+            D[i, j] = 0.0 if groups[i] == groups[j] else 1.0
+            D[j, i] = D[i, j]
+    return D
 
-        # Edge case: if a sequence somehow has zero valid tokens,
-        # fallback to using attention_mask-only (non-pad) to avoid NaNs
-        if valid.sum(dim=1).min().item() == 0:
-            if attention_mask is not None:
-                valid = attention_mask.bool()
-            else:
-                valid = torch.ones((B, T), dtype=torch.bool, device=x.device)
 
-        if pooling == "mean":
-            m = valid.unsqueeze(-1).float()  # [B,T,1]
-            denom = m.sum(dim=1).clamp_min(1.0)  # [B,1]
-            return (x * m).sum(dim=1) / denom  # [B,H]
+# -----------------------------
+# Extraction (aligned via signatures)
+# -----------------------------
+def compute_layer_vectors(
+    model_name: str,
+    device: str,
+    max_length: int,
+    batch_size: int,
+    torch_dtype: Optional[str],
+    trust_remote_code: bool,
+    concept_to_forms: Dict[str, List[str]],
+    layers: List[int],
+    word_pooling: str,
+    concept_pooling: str,
+) -> Tuple[Dict[int, np.ndarray], List[str], Dict[str, Any]]:
+    """
+    Returns:
+      vecs_by_layer: {layer: np.ndarray [N,H]}
+      concept_ids: list[str] order for RDM labels
+      meta: dict for debugging / provenance
+    """
+    ext = _safe_construct_extractor(
+        model_name=model_name,
+        device=device,
+        max_length=max_length,
+        batch_size=batch_size,
+        default_pooling=word_pooling,
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+    )
 
-        if pooling == "cls":
-            # Note: for BERT-like models, x[:,0,:] corresponds to [CLS], not "word".
-            return x[:, 0, :]
+    # Prefer get_concept_vectors; if your extract.py later renames it, you'll see a clear error.
+    concept_vecs_by_layer, concept_meta = _safe_call(
+        ext,
+        "get_concept_vectors",
+        concept_to_forms=concept_to_forms,
+        layers=layers,
+        word_pooling=word_pooling,
+        concept_pooling=concept_pooling,
+        return_meta=True,
+    )
 
-        if pooling in ("last", "last_token"):
-            # Find last valid content token per sequence
-            pos = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  # [B,T]
-            pos = pos.masked_fill(~valid, -1)
-            idx = pos.max(dim=1).values.clamp_min(0)  # [B]
-            return x[torch.arange(B, device=x.device), idx, :]  # [B,H]
-
-        raise ValueError("Unknown pooling. Use one of: mean | cls | last")
-
-    def _build_tokenization_meta(self, inputs: Dict[str, Tensor]) -> Dict[str, Any]:
-        """
-        Build tokenization metadata useful for later controls (token count, etc.).
-        """
-        input_ids = inputs["input_ids"].detach().cpu()
-        attn = inputs.get("attention_mask", None)
-        special = inputs.get("special_tokens_mask", None)
-
-        tokens_per_item: List[List[str]] = []
-        for row in input_ids:
-            tokens_per_item.append(self.tokenizer.convert_ids_to_tokens(row.tolist()))
-
-        meta: Dict[str, Any] = {
-            "input_ids": input_ids,
-            "tokens": tokens_per_item,
-        }
-
-        if attn is not None:
-            meta["attention_mask"] = attn.detach().cpu()
-        if special is not None:
-            meta["special_tokens_mask"] = special.detach().cpu()
-
-        # content token count = non-pad & non-special
-        if attn is not None and special is not None:
-            valid = attn.bool() & (~special.bool())
-            meta["content_token_count"] = valid.sum(dim=1).detach().cpu()
-        elif attn is not None:
-            meta["content_token_count"] = attn.sum(dim=1).detach().cpu()
-
-        return meta
-
-    # -------------------------
-    # Word vectors & concept pooling
-    # -------------------------
-
-    @torch.no_grad()
-    def get_word_vectors(
-        self,
-        surface_forms: List[str],
-        layers: Optional[List[int]] = None,
-        pooling: str = "mean",
-        return_meta: bool = False,
-    ) -> Union[Dict[int, Tensor], Tuple[Dict[int, Tensor], List[Dict[str, Any]]]]:
-        """
-        Compute word vectors for multiple surface forms (batching internally).
-        Returns dict: layer -> [N, H]
-        """
-        if layers is None:
-            layers = [-1]
-
-        pooling = pooling.lower()
-        bs = max(1, self.cfg.batch_size)
-
-        chunks = [surface_forms[i : i + bs] for i in range(0, len(surface_forms), bs)]
-        out_by_layer: Dict[int, List[Tensor]] = {li: [] for li in layers}
-        metas: List[Dict[str, Any]] = []
-
-        for chunk in chunks:
-            if return_meta:
-                pooled, meta = self.get_hidden_states(
-                    text=chunk,
-                    layers=layers,
-                    pooling=pooling,
-                    return_token_level=False,
-                    return_tokenization_meta=True,
-                )
-                metas.extend(self._split_meta_per_item(meta))
-            else:
-                pooled = self.get_hidden_states(
-                    text=chunk,
-                    layers=layers,
-                    pooling=pooling,
-                    return_token_level=False,
-                    return_tokenization_meta=False,
-                )
-
-            for li in layers:
-                out_by_layer[li].append(pooled[li].detach().cpu())
-
-        stacked = {li: torch.cat(out_by_layer[li], dim=0) for li in layers}
-        if return_meta:
-            return stacked, metas
-        return stacked
-
-    def _split_meta_per_item(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Convert batch meta dict into a list of per-item meta dicts.
-        """
-        n = meta["input_ids"].shape[0]
-        per: List[Dict[str, Any]] = []
-        for i in range(n):
-            item: Dict[str, Any] = {
-                "input_ids": meta["input_ids"][i].tolist(),
-                "tokens": meta["tokens"][i],
-            }
-            if "attention_mask" in meta:
-                item["attention_mask"] = meta["attention_mask"][i].tolist()
-            if "special_tokens_mask" in meta:
-                item["special_tokens_mask"] = meta["special_tokens_mask"][i].tolist()
-            if "content_token_count" in meta:
-                item["content_token_count"] = int(meta["content_token_count"][i].item())
-            per.append(item)
-        return per
-
-    @torch.no_grad()
-    def get_concept_vectors(
-        self,
-        concept_to_forms: Dict[str, List[str]],
-        layers: Optional[List[int]] = None,
-        word_pooling: str = "mean",
-        concept_pooling: str = "mean",  # for now: mean only
-        return_meta: bool = False,
-    ) -> Union[
-        Dict[int, Tensor],
-        Tuple[Dict[int, Tensor], Dict[str, Any]],
-    ]:
-        """
-        Concept pooling across multiple surface forms (cross-lingual synonyms).
-
-        Steps:
-          1) for each surface form: word-level pooling over content tokens -> v_form
-          2) for each concept: aggregate its forms -> v_concept
-          3) returns dict layer -> [num_concepts, H] (concepts in fixed order)
-        """
-        if layers is None:
-            layers = [-1]
-        if concept_pooling.lower() != "mean":
-            raise ValueError("Currently only concept_pooling='mean' is implemented (robust baseline).")
-
+    # meta should include concept_ids; fallback: use input order
+    concept_ids = concept_meta.get("concept_ids")
+    if concept_ids is None:
         concept_ids = list(concept_to_forms.keys())
-        all_forms: List[str] = []
-        form_owner: List[str] = []
-        for cid in concept_ids:
-            forms = concept_to_forms[cid]
-            if len(forms) == 0:
-                raise ValueError(f"Concept '{cid}' has 0 surface forms.")
-            all_forms.extend(forms)
-            form_owner.extend([cid] * len(forms))
 
-        if return_meta:
-            form_vecs_by_layer, metas = self.get_word_vectors(
-                all_forms, layers=layers, pooling=word_pooling, return_meta=True
-            )
+    vecs_by_layer: Dict[int, np.ndarray] = {}
+    for li in layers:
+        X = concept_vecs_by_layer[li]
+        if isinstance(X, torch.Tensor):
+            X = X.detach().cpu()
+        vecs_by_layer[li] = np.asarray(X, dtype=np.float64)
+
+    # best-effort config page
+    cfg = None
+    if hasattr(ext, "get_config_page"):
+        try:
+            cfg = ext.get_config_page()
+        except Exception:
+            cfg = None
+
+    meta_out = {
+        "concept_meta": concept_meta,
+        "extractor_config": cfg,
+        "model_name": model_name,
+        "device": device,
+        "layers": layers,
+        "word_pooling": word_pooling,
+        "concept_pooling": concept_pooling,
+        "max_length": max_length,
+        "batch_size": batch_size,
+        "metric_note": "RDM computed on concept-level vectors returned by extract.py",
+    }
+    return vecs_by_layer, list(concept_ids), meta_out
+
+
+# -----------------------------
+# Saving
+# -----------------------------
+def save_rdm_square(out_csv: Path, out_npy: Path, D: np.ndarray, labels: List[str]) -> None:
+    pd.DataFrame(D, index=labels, columns=labels).to_csv(out_csv, index=True)
+    np.save(out_npy, D)
+
+
+def make_long_table(layer: int, D: np.ndarray, labels: List[str]) -> pd.DataFrame:
+    iu = np.triu_indices(D.shape[0], k=1)
+    i, j = iu[0], iu[1]
+    return pd.DataFrame(
+        {
+            "layer": layer,
+            "i": i,
+            "j": j,
+            "item_i": [labels[k] for k in i],
+            "item_j": [labels[k] for k in j],
+            "dissimilarity": D[i, j],
+        }
+    )
+
+
+def parse_layers(xs: List[str]) -> List[int]:
+    out: List[int] = []
+    for x in xs:
+        if "," in x:
+            out.extend([int(t.strip()) for t in x.split(",") if t.strip() != ""])
         else:
-            form_vecs_by_layer = self.get_word_vectors(
-                all_forms, layers=layers, pooling=word_pooling, return_meta=False
-            )
-            metas = []
+            out.append(int(x))
+    # de-dup preserve order
+    seen = set()
+    dedup = []
+    for li in out:
+        if li not in seen:
+            dedup.append(li)
+            seen.add(li)
+    return dedup
 
-        # map concept -> indices in all_forms
-        owner_to_indices: Dict[str, List[int]] = {cid: [] for cid in concept_ids}
-        for i, cid in enumerate(form_owner):
-            owner_to_indices[cid].append(i)
 
-        # aggregate
-        concept_vecs_by_layer: Dict[int, Tensor] = {}
+# -----------------------------
+# CLI
+# -----------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser(description="RSA per layer (aligned with extract.py).")
+
+    ap.add_argument("--model_name", type=str, required=True, help="HF model name or local path")
+    ap.add_argument("--inputs", type=str, required=True, help=".json or .csv/.tsv with concept,form")
+    ap.add_argument("--layers", nargs="+", default=["-1"], help="e.g. --layers -1 -6 -12 or --layers -1,-6,-12")
+    ap.add_argument("--metric", type=str, default="correlation", choices=["correlation", "cosine", "euclidean"])
+    ap.add_argument("--word_pooling", type=str, default="mean", help="passed to extract.py (if supported)")
+    ap.add_argument("--concept_pooling", type=str, default="mean", help="passed to extract.py (if supported)")
+    ap.add_argument("--device", type=str, default="cpu", help="cpu or cuda")
+    ap.add_argument("--max_length", type=int, default=32)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--torch_dtype", type=str, default=None, help="e.g. float16 (if supported)")
+    ap.add_argument("--trust_remote_code", action="store_true")
+    ap.add_argument("--out_dir", type=str, default="artifacts/rsa")
+    ap.add_argument("--target_groups", type=str, default=None, help="optional .csv/.tsv concept,group")
+
+    args = ap.parse_args()
+
+    layers = parse_layers(args.layers)
+    out_dir = ensure_out_dir(args.out_dir)
+
+    concept_to_forms = load_concept_map(args.inputs)
+    target_map = load_target_groups(args.target_groups)
+
+    # Save inputs map for provenance
+    (out_dir / "inputs_concept_map.json").write_text(
+        json.dumps(concept_to_forms, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    vecs_by_layer, concept_ids, meta = compute_layer_vectors(
+        model_name=args.model_name,
+        device=args.device,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        torch_dtype=args.torch_dtype,
+        trust_remote_code=args.trust_remote_code,
+        concept_to_forms=concept_to_forms,
+        layers=layers,
+        word_pooling=args.word_pooling,
+        concept_pooling=args.concept_pooling,
+    )
+
+    (out_dir / "rsa_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+    # Compute & save RDMs
+    rdm_by_layer: Dict[int, np.ndarray] = {}
+    long_tables: List[pd.DataFrame] = []
+
+    for li in layers:
+        X = vecs_by_layer[li]
+        D = compute_rdm(X, metric=args.metric)
+        rdm_by_layer[li] = D
+
+        save_rdm_square(
+            out_csv=out_dir / f"rdm_layer{li}.csv",
+            out_npy=out_dir / f"rdm_layer{li}.npy",
+            D=D,
+            labels=concept_ids,
+        )
+
+        long_tables.append(make_long_table(li, D, concept_ids))
+
+    pd.concat(long_tables, ignore_index=True).to_csv(out_dir / "rsa_long.csv", index=False)
+
+    # Layerwise similarity (Spearman over upper-triangle RDM)
+    if len(layers) >= 2:
+        rows = []
+        for a in range(len(layers)):
+            for b in range(a + 1, len(layers)):
+                la, lb = layers[a], layers[b]
+                va = rdm_upper_triangle(rdm_by_layer[la])
+                vb = rdm_upper_triangle(rdm_by_layer[lb])
+                rho = spearman_corr(va, vb)
+                rows.append({"layer_a": la, "layer_b": lb, "spearman_rho": rho})
+        pd.DataFrame(rows).to_csv(out_dir / "layerwise_rdm_similarity.csv", index=False)
+
+    # Optional: target RSA
+    if target_map is not None:
+        target_D = categorical_target_rdm(concept_ids, target_map)
+        save_rdm_square(out_dir / "target_rdm.csv", out_dir / "target_rdm.npy", target_D, concept_ids)
+
+        vt = rdm_upper_triangle(target_D)
+        rows = []
         for li in layers:
-            M = form_vecs_by_layer[li]  # [num_forms, H] on CPU
-            concept_vecs: List[Tensor] = []
-            for cid in concept_ids:
-                idxs = owner_to_indices[cid]
-                X = M[idxs, :]  # [k, H]
-                concept_vecs.append(X.mean(dim=0, keepdim=True))  # [1, H]
-            concept_vecs_by_layer[li] = torch.cat(concept_vecs, dim=0)  # [num_concepts, H]
+            v = rdm_upper_triangle(rdm_by_layer[li])
+            rho = spearman_corr(v, vt)
+            rows.append({"layer": li, "spearman_rho_to_target": rho})
+        pd.DataFrame(rows).to_csv(out_dir / "layer_vs_target_rsa.csv", index=False)
 
-        if return_meta:
-            meta_out = {
-                "concept_ids": concept_ids,
-                "all_forms": all_forms,
-                "form_owner": form_owner,
-                "form_tokenization": metas,
-                "owner_to_indices": owner_to_indices,
-                "word_pooling": word_pooling,
-                "concept_pooling": concept_pooling,
-            }
-            return concept_vecs_by_layer, meta_out
-
-        return concept_vecs_by_layer
-
-    # -------------------------
-    # Config page helpers
-    # -------------------------
-
-    def get_config_page(self) -> dict:
-        return {
-            "model_name": self.cfg.model_name,
-            "device": self.cfg.device,
-            "max_length": self.cfg.max_length,
-            "default_pooling": self.cfg.default_pooling,
-            "batch_size": self.cfg.batch_size,
-            "torch_dtype": self.cfg.torch_dtype,
-            "trust_remote_code": self.cfg.trust_remote_code,
-            "is_decoder_only": self.is_decoder_only,
-            "model_config": self.model_config_dict,
-            "tokenizer_config": self.tokenizer_config_dict,
-        }
-
-    def save_config_page(self, out_path: Union[str, Path]) -> None:
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(self.get_config_page(), ensure_ascii=False, indent=2))
+    print(f"Saved RSA outputs to: {out_dir.resolve()}")
+    print(f"Concepts: {len(concept_ids)} | Layers: {layers} | Metric: {args.metric}")
 
 
-class extract_transformer_hidden_states:
-    """
-    Wrapper keeping your original usage pattern, plus concept pooling.
-
-    Example:
-        ext = extract_transformer_hidden_states("xlm-roberta-base", device="cpu")
-        # word vectors
-        word_vecs = ext.get_word_vectors(["casa", "house", "房子"], layers=[-1, -6], word_pooling="mean")
-        # concept vectors
-        concept_to_forms = {
-            "HOUSE": ["house", "casa", "房子", "住宅"],
-            "DOG": ["dog", "perro", "狗"],
-        }
-        concept_vecs, meta = ext.get_concept_vectors(concept_to_forms, layers=[-1], return_meta=True)
-        ext.save_config_page("artifacts/xlm-roberta-base_config.json")
-    """
-
-    def __init__(
-        self,
-        model_name: str,
-        device: str = "cpu",
-        max_length: int = 32,
-        batch_size: int = 32,
-        default_pooling: str = "mean",
-        torch_dtype: Optional[str] = None,
-        trust_remote_code: bool = False,
-    ):
-        cfg = ExtractionConfig(
-            model_name=model_name,
-            device=device,
-            max_length=max_length,
-            batch_size=batch_size,
-            default_pooling=default_pooling,
-            torch_dtype=torch_dtype,
-            trust_remote_code=trust_remote_code,
-        )
-        self.extractor = HiddenStateExtractor(cfg)
-
-    def get_hidden_states(self, *args, **kwargs):
-        return self.extractor.get_hidden_states(*args, **kwargs)
-
-    def get_word_vectors(
-        self,
-        surface_forms: List[str],
-        layers: Optional[List[int]] = None,
-        word_pooling: str = "mean",
-        return_meta: bool = False,
-    ):
-        return self.extractor.get_word_vectors(
-            surface_forms=surface_forms,
-            layers=layers,
-            pooling=word_pooling,
-            return_meta=return_meta,
-        )
-
-    def get_concept_vectors(
-        self,
-        concept_to_forms: Dict[str, List[str]],
-        layers: Optional[List[int]] = None,
-        word_pooling: str = "mean",
-        concept_pooling: str = "mean",
-        return_meta: bool = False,
-    ):
-        return self.extractor.get_concept_vectors(
-            concept_to_forms=concept_to_forms,
-            layers=layers,
-            word_pooling=word_pooling,
-            concept_pooling=concept_pooling,
-            return_meta=return_meta,
-        )
-
-    def get_config_page(self) -> dict:
-        return self.extractor.get_config_page()
-
-    def save_config_page(self, out_path: Union[str, Path]) -> None:
-        self.extractor.save_config_page(out_path)
+if __name__ == "__main__":
+    main()
