@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsa-multilingual"
+version = "0.1.0"
+description = "Multilingual RSA pipeline (extract -> rsa -> viz) for LLM embeddings."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name="Sebastian"}]
+
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=2.0",
+  "matplotlib>=3.7",
+  "torch",
+  "transformers>=4.41",
+  "accelerate>=0.30",
+  "sentencepiece; platform_system != 'Windows'",
+  "rsatoolbox>=0.1.5",
+  "openpyxl>=3.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

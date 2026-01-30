@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Notebook
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Local envs
+.venv/
+venv/
+.env/
+conda/
+.mamba/
+
+# Caches
+.cache/
+pytest_cache/
+.mypy_cache/
+ruff_cache/
+
+# Outputs (your pipeline artifacts)
+results/
+reports/
+artifacts/
+*.npy
+*.npz
+
+# Model caches (HF / Torch)
+**/.huggingface/
+**/transformers_cache/
+**/.torch/
+**/torch_cache/
+

@@ -2,43 +2,36 @@
 # -*- coding: utf-8 -*-
 
 """
-MDS.py (rsatoolbox version)
+scripts/mds.py
 
-Visualize RDMs using rsatoolbox:
-- RDM heatmap: rsatoolbox.vis.show_rdm
-- MDS scatter: rsatoolbox.vis.show_MDS
-
-Inputs:
-1) --input_type rdm_csv: rdm_layer{L}.csv (square, with labels as row/col names)
-2) --input_type rsa_long: rsa_long.csv + --layer (reconstruct square RDM)
-
-Outputs (in --out_dir):
-- rdm_layer{L}_rsatoolbox.png
-- mds_layer{L}_rsatoolbox.png
-- mds_layer{L}_coords.csv
-
-Notes:
-- rsatoolbox expects RDMs in shape [n_rdm, n_cond, n_cond]; we wrap with leading dim.
+Thin CLI wrapper:
+- loads RDM from rdm_layer*.csv OR reconstructs from rsa_long.csv
+- calls rsa_multilingual.viz.viz_rdm_and_mds(...) which uses rsatoolbox
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
-import matplotlib.pyplot as plt
-from rsatoolbox import vis, rdm
+# Ensure repo_root/src is importable
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from rsa_multilingual.viz import viz_rdm_and_mds  # noqa: E402
 
 
 def load_rdm_from_csv(path: Path) -> Tuple[np.ndarray, List[str]]:
     df = pd.read_csv(path, index_col=0)
     labels = df.index.astype(str).tolist()
     D = df.to_numpy(dtype=float)
-    _sanity_square(D, labels)
     return D, labels
 
 
@@ -66,74 +59,7 @@ def load_rdm_from_long(path: Path, layer: int) -> Tuple[np.ndarray, List[str]]:
         D[j, i] = d
 
     np.fill_diagonal(D, 0.0)
-    _sanity_square(D, labels)
     return D, labels
-
-
-def _sanity_square(D: np.ndarray, labels: List[str]) -> None:
-    if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError(f"RDM must be square, got {D.shape}")
-    if len(labels) != D.shape[0]:
-        raise ValueError(f"labels length {len(labels)} != RDM size {D.shape[0]}")
-    # enforce symmetry + diagonal
-    D[:] = (D + D.T) / 2.0
-    np.fill_diagonal(D, 0.0)
-
-
-def build_rsatoolbox_rdms(D: np.ndarray, labels: List[str], layer: int, measure: str) -> rdm.RDMs:
-    # rsatoolbox expects [n_rdm, n_cond, n_cond]
-    Ds = D[None, :, :]
-    rdms = rdm.RDMs(
-        dissimilarities=Ds,
-        dissimilarity_measure=measure,
-        rdm_descriptors={"name": f"layer {layer}", "layer": layer},
-        pattern_descriptors={"label": labels, "index": list(range(len(labels)))},
-    )
-    return rdms
-
-
-def save_show_rdm(rdms: rdm.RDMs, out_png: Path, pattern_descriptor: str = "label") -> None:
-    fig, ax, _ = vis.show_rdm(
-        rdms,
-        rdm_descriptor="name",
-        pattern_descriptor=pattern_descriptor,
-        show_colorbar="figure",
-    )
-    fig.savefig(out_png, bbox_inches="tight", dpi=300)
-    plt.close(fig)
-
-
-def save_show_mds(rdms: rdm.RDMs, out_png: Path, pattern_descriptor: str = "label") -> None:
-    # show_MDS returns a matplotlib figure/axes in recent versions; we handle both cases.
-    ret = vis.show_MDS(
-        rdms,
-        rdm_descriptor="name",
-        pattern_descriptor=pattern_descriptor,
-    )
-    if isinstance(ret, tuple) and len(ret) >= 1 and hasattr(ret[0], "savefig"):
-        fig = ret[0]
-    else:
-        fig = plt.gcf()
-    fig.savefig(out_png, bbox_inches="tight", dpi=300)
-    plt.close(fig)
-
-
-def export_mds_coords(D: np.ndarray, labels: List[str], out_csv: Path) -> None:
-    # Classical MDS coords from double-centering (simple + no sklearn dependency)
-    n = D.shape[0]
-    D2 = D ** 2
-    J = np.eye(n) - np.ones((n, n)) / n
-    B = -0.5 * (J @ D2 @ J)
-    evals, evecs = np.linalg.eigh(B)
-    order = np.argsort(evals)[::-1]
-    evals = evals[order]
-    evecs = evecs[:, order]
-    pos = evals > 1e-12
-    evals = evals[pos]
-    evecs = evecs[:, pos]
-    k = min(2, len(evals))
-    X = evecs[:, :k] @ np.diag(np.sqrt(evals[:k]))
-    pd.DataFrame({"label": labels, "x": X[:, 0], "y": X[:, 1]}).to_csv(out_csv, index=False)
 
 
 def infer_layer_from_name(name: str) -> int:
@@ -158,9 +84,6 @@ def main() -> None:
     if not in_path.exists():
         raise FileNotFoundError(in_path)
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     if args.input_type == "rdm_csv":
         D, labels = load_rdm_from_csv(in_path)
         layer = args.layer if args.layer is not None else infer_layer_from_name(in_path.name)
@@ -170,20 +93,17 @@ def main() -> None:
         layer = int(args.layer)
         D, labels = load_rdm_from_long(in_path, layer=layer)
 
-    rdms = build_rsatoolbox_rdms(D, labels, layer=layer, measure=args.measure)
+    viz_rdm_and_mds(
+        D=D,
+        labels=labels,
+        layer=layer,
+        out_dir=args.out_dir,
+        tag=args.tag,
+        measure=args.measure,
+        pattern_descriptor=args.pattern_descriptor,
+    )
 
-    tag = f"_{args.tag}" if args.tag else ""
-    out_rdm = out_dir / f"rdm_layer{layer}_rsatoolbox{tag}.png"
-    out_mds = out_dir / f"mds_layer{layer}_rsatoolbox{tag}.png"
-    out_xy = out_dir / f"mds_layer{layer}_coords{tag}.csv"
-
-    save_show_rdm(rdms, out_rdm, pattern_descriptor=args.pattern_descriptor)
-    save_show_mds(rdms, out_mds, pattern_descriptor=args.pattern_descriptor)
-    export_mds_coords(D, labels, out_xy)
-
-    print(f"Saved: {out_rdm.resolve()}")
-    print(f"Saved: {out_mds.resolve()}")
-    print(f"Saved: {out_xy.resolve()}")
+    print(f"Saved visualizations to: {Path(args.out_dir).resolve()}")
 
 
 if __name__ == "__main__":
