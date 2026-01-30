@@ -10,9 +10,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 
-[[project.authors]]
-name = "Sebastian Chuqiao Song"
-
 dependencies = [
   "numpy>=1.23",
   "pandas>=2.0",
