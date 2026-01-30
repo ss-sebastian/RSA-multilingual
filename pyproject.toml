@@ -9,7 +9,9 @@ description = "Multilingual RSA pipeline (extract -> rsa -> viz) for LLM embeddi
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-author = "Sebastian Chuqiao Song"
+
+[[project.authors]]
+name = "Sebastian Chuqiao Song"
 
 dependencies = [
   "numpy>=1.23",
