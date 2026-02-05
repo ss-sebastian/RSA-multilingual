@@ -303,7 +303,6 @@ def main() -> None:
     ap.add_argument("--concept_col", type=str, default="concept")
     ap.add_argument("--lang_cols", type=str, nargs="*", default=None, help="For wide input, e.g. --lang_cols en es zh")
     ap.add_argument("--rdm_corr", type=str, choices=["spearman", "pearson"], default="spearman")
-    ap.add_argument("--trust_remote_code", action="store_true")
 
 
     args = ap.parse_args()
@@ -325,6 +324,7 @@ def main() -> None:
             batch_size=int(args.batch_size),
             torch_dtype=args.torch_dtype,
             trust_remote_code=bool(args.trust_remote_code),
+            
         )
         # Save
         _safe_dump_result(res, out_dir)
